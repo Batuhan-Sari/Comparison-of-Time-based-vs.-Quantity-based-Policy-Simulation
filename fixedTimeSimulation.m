@@ -2,17 +2,19 @@
 clear; clc;
 
 % --- Parameters ---
-days = 300;
-lambda = 2;
-T = 3;                                  % Fixed shipment interval
+lambda = 10;
+mu = 0.01;
+T = 10;                                  % Fixed shipment in terval
 fixedCostPerShipment = 500;
-variableCostPerUnit = 1;
-w = 0.5;                                  % Waiting cost per unit per day
+variableCostPerUnit = 10;
+w = 1;                                % Waiting cost per unit per day
+c = 2;
+days = 1000*T;                        % # of cycles simulation runs  
 
 % --- Initialization ---
 eventTime = 0;
 shipments = 0;
-shipmentDays = [];
+shipmentTimes = [];
 unitsShipped = [];
 inventoryLevel = 0;
 inventoryHistory = [];
@@ -25,27 +27,80 @@ orderArrivalTimes = [];
 totalOrders = 0;
 nextShipmentTime = T;
 
+% === Cancellation Setup ===
+canceledWaitingTimes = [];
+orderPatienceDeadlines = [];  % For each order there is Exp. distributed patience time
+nextOrderTime = -log(rand) / lambda;
+nextCancelTime = -log(rand) / mu;
+
 % === EVENT-BASED SIMULATION ===
 while eventTime < days
-    % Generate interarrival time (exponential) for next order
-    interArrival = -log(rand) / lambda;
-    eventTime = eventTime + interArrival;
+    % --- Cancel orders whose patience has expired (before any event) ---
+    expiredIdx = find(orderPatienceDeadlines <= eventTime);
+    for i = fliplr(expiredIdx)
+        canceledWaitingTimes(end+1) = eventTime - orderArrivalTimes(i);
+        orderArrivalTimes(i) = [];
+        orderPatienceDeadlines(i) = [];
+        inventoryLevel = inventoryLevel - 1;
 
-    if eventTime > days
-        break
+        inventoryHistory(end+1) = inventoryLevel;
+        inventoryTimestamps(end+1) = eventTime;
     end
 
-    % One new order arrives
-    orderArrivalTimes = [orderArrivalTimes, eventTime];
-    totalOrders = totalOrders + 1;
-    inventoryLevel = inventoryLevel + 1;
+    % Choose the next event (order or cancellation)
+    if nextOrderTime <= nextCancelTime
+        % Order arrives
+        eventTime = nextOrderTime;
+        nextOrderTime = eventTime + (-log(rand) / lambda);
 
-    inventoryHistory(end+1) = inventoryLevel;
-    inventoryTimestamps(end+1) = eventTime;
+        if eventTime > days
+            break;
+        end
+
+        orderArrivalTimes = [orderArrivalTimes, eventTime];
+        patience = -log(rand) / mu;  % <-- ADDED
+        orderPatienceDeadlines = [orderPatienceDeadlines, eventTime + patience];  % <-- ADDED
+        totalOrders = totalOrders + 1;
+        inventoryLevel = inventoryLevel + 1;
+
+        inventoryHistory(end+1) = inventoryLevel;
+        inventoryTimestamps(end+1) = eventTime;
+        
+    else
+        % Cancellation occurs
+        eventTime = nextCancelTime;
+        nextCancelTime = eventTime + (-log(rand) / mu);
+
+        if eventTime > days
+            break;
+        end
+
+        if ~isempty(orderArrivalTimes)
+            canceledWaitingTimes(end+1) = eventTime - orderArrivalTimes(1);  % Include in cost
+            orderArrivalTimes(1) = [];
+            orderPatienceDeadlines(1) = [];  % <-- ADDED
+            inventoryLevel = inventoryLevel - 1;
+
+            inventoryHistory(end+1) = inventoryLevel;
+            inventoryTimestamps(end+1) = eventTime;
+        end
+    end
 
     % Check for shipment
     if eventTime >= nextShipmentTime
-        % All orders waiting are shipped now
+        % Cancel expired orders again before shipping (edge case)
+        expiredIdx = find(orderPatienceDeadlines <= eventTime);
+        for i = fliplr(expiredIdx)
+            canceledWaitingTimes(end+1) = eventTime - orderArrivalTimes(i);
+            orderArrivalTimes(i) = [];
+            orderPatienceDeadlines(i) = [];
+            inventoryLevel = inventoryLevel - 1;
+
+            inventoryHistory(end+1) = inventoryLevel;
+            inventoryTimestamps(end+1) = eventTime;
+        end
+
+        % All remaining orders are shipped now
         waitingTimes = eventTime - orderArrivalTimes;
         totalWaitingTime = totalWaitingTime + sum(waitingTimes);
         waitingTimePerShipment{end+1} = waitingTimes;
@@ -53,11 +108,12 @@ while eventTime < days
 
         % Record shipment
         shipments = shipments + 1;
-        shipmentDays(end+1) = eventTime;
+        shipmentTimes(end+1) = eventTime;
         unitsShipped(end+1) = length(orderArrivalTimes);
 
         % Reset
         orderArrivalTimes = [];
+        orderPatienceDeadlines = [];  % <-- ADDED
         inventoryLevel = 0;
 
         inventoryHistory(end+1) = inventoryLevel;
@@ -70,45 +126,72 @@ end
 
 % === Cost Calculations ===
 totalUnitsShipped = sum(unitsShipped);
+totalCancel = length(canceledWaitingTimes);
 variableCost = totalUnitsShipped * variableCostPerUnit;
 waitingCost = w * totalWaitingTime;
-totalCost = shipments * fixedCostPerShipment + variableCost + waitingCost;
+canceledWaitingCost = w * sum(canceledWaitingTimes);
+totalCost = shipments * fixedCostPerShipment + variableCost + waitingCost + canceledWaitingCost;
 averageCostPerDay = totalCost / days;
 
 % === OUTPUT ===
 fprintf('=== EVENT-BASED STATIC POLICY ===\n');
 fprintf('Total Shipments: %d\n', shipments);
-fprintf('Total Units Shipped: %d\n', totalUnitsShipped);
+fprintf('Total Units Shipped: %.2f\n', totalUnitsShipped);
+fprintf('Average Units in a Shipment: %.2f\n', mean(unitsShipped));
 fprintf('Total Orders: %d\n', totalOrders);
+fprintf('Canceled Orders: %d\n', length(canceledWaitingTimes));
+fprintf('Canceled Waiting Time: %.2f\n', sum(canceledWaitingTimes));
 fprintf('Total Waiting Time (unit-days): %.2f\n', totalWaitingTime);
 fprintf('Variable Cost: $%.2f\n', variableCost);
 fprintf('Waiting Cost: $%.2f\n', waitingCost);
+fprintf('Canceled Waiting Cost: $%.2f\n', canceledWaitingCost);
 fprintf('Total Cost: $%.2f\n', totalCost);
 fprintf('Average Cost per Day: $%.2f\n', averageCostPerDay);
 
-% === PLOTS ===
 
-% Inventory Level Over Time (Event-Based)
+% === PLOTS === 
 figure;
 stairs(inventoryTimestamps, inventoryHistory, 'LineWidth', 1.5);
 hold on;
-stem(shipmentDays, zeros(size(shipmentDays)), 'r', 'filled', 'LineStyle', 'none');
+stem(shipmentTimes, zeros(size(shipmentTimes)), 'r', 'filled', 'LineStyle', 'none');
 xlabel('Time (Days)');
 ylabel('Inventory Level');
 title('Inventory Level Over Time (Event-Based Simulation)');
 legend('Inventory Level', 'Shipment Events');
 grid on;
 
-% === PLOT: Cumulative Waiting Time of Orders Over Time ===
-figure;
+%figure;
 plot(1:length(cumulativeWaitingPerShipment), cumulativeWaitingPerShipment, '-o', 'LineWidth', 1.5);
 xlabel('Shipment Number');
 ylabel('Cumulative Waiting Time (unit-days)');
 title('Cumulative Waiting Time per Shipment');
 grid on;
 
+% === PLOT: Comparison of Waiting Times (Canceled vs Non-Canceled) ===
+% Prepare vectors
+numShipments = length(waitingTimePerShipment);
+nonCanceledWaiting = cellfun(@sum, waitingTimePerShipment);
+canceledWaiting = zeros(1, numShipments);
 
-% === Poisson Interarrival Generator ===
+% Distribute canceled waiting times into shipment intervals (roughly)
+if ~isempty(canceledWaitingTimes)
+    cancelTimes = cumsum(canceledWaitingTimes);  % approximate times
+    cancelBins = discretize(cancelTimes, [0, shipmentTimes]);
+    for i = 1:numShipments
+        canceledWaiting(i) = sum(canceledWaitingTimes(cancelBins == i));
+    end
+end
+
+% Plot
+figure;
+bar(1:numShipments, [nonCanceledWaiting(:), canceledWaiting(:)], 'stacked');
+xlabel('Shipment Number');
+ylabel('Total Waiting Time');
+legend('Shipped Orders', 'Canceled Orders');
+title('Comparison of Waiting Time per Shipment');
+grid on;
+
+% === Poisson Order Interarrival Generator ===
 function samples = myPoisson(lambda, n)
 samples = zeros(1, n);
 for i = 1:n
@@ -121,3 +204,9 @@ for i = 1:n
     samples(i) = k - 1;
 end
 end
+
+% === Poisson Cancellation Interarrival Generator ===
+function cancels = generateExpCancels(mu, n)
+    cancels = -log(rand(1, n)) / mu;
+end
+
